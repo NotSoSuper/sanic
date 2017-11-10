@@ -10,16 +10,10 @@ try:
 except ImportError:
     ssl = None
 
-try:
-    import uvloop
-    asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
-except ImportError:
-    pass
 import gunicorn.workers.base as base
 
 from sanic.server import trigger_events, serve, HttpProtocol, Signal
 from sanic.websocket import WebSocketProtocol
-
 
 class GunicornWorker(base.Worker):
 
@@ -37,6 +31,7 @@ class GunicornWorker(base.Worker):
         self.connections = set()
         self.exit_code = 0
         self.signal = Signal()
+        self.updater_task = None
 
     def init_process(self):
         # create new event_loop after fork
@@ -134,7 +129,34 @@ class GunicornWorker(base.Worker):
             )
             self.servers[server] = state
 
+    async def run_process(self, args):
+        proc = await asyncio.create_subprocess_exec(*args, stderr=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, loop=self.loop)
+        try:
+            data, _ = await asyncio.wait_for(proc.communicate(), timeout=120)
+        except asyncio.TimeoutError:
+            return False
+        try:
+            decoded = data.decode('ascii')
+        except:
+            decoded = data.decode('utf-8')
+        return decoded.rstrip()
+
+    async def updater(self):
+        while self.alive:
+            print('Checking GitHub for updates')
+            await self.run_process(['git', 'remote', 'update'])
+            local = await self.run_process(['git', 'rev-parse', 'HEAD'])
+            remote = await self.run_process(['git', 'rev-parse', '@{u}'])
+            if local != remote:
+                print('-- UPDATING -- EXITING --')
+                await self.run_process(['git', 'pull', 'origin', 'master'])
+                return os.kill(os.getppid(), signal.SIGINT)
+            await asyncio.sleep(90)
+
     async def _check_alive(self):
+        #updater
+        if self.age == 1:
+            self.updater_task = self.loop.create_task(self.updater())
         # If our parent changed then we shut down.
         pid = os.getpid()
         try:
@@ -200,6 +222,8 @@ class GunicornWorker(base.Worker):
         self.alive = False
         self.app.callable.is_running = False
         self.cfg.worker_int(self)
+        if self.updater_task:
+            self.updater_task.cancel()
 
     def handle_abort(self, sig, frame):
         self.alive = False
